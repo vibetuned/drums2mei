@@ -53,13 +53,24 @@ def generate_mei(pattern):
     if "/" in signature:
         meter_count, meter_unit = signature.split('/')
 
-    scoreDef = ET.SubElement(score, "{%s}scoreDef" % mei_ns, {"meter.count": meter_count, "meter.unit": meter_unit})
+    scoreDef = ET.SubElement(score, "{%s}scoreDef" % mei_ns)
     staffGrp = ET.SubElement(scoreDef, "{%s}staffGrp" % mei_ns)
-    ET.SubElement(staffGrp, "{%s}staffDef" % mei_ns, {"n": "1", "lines": "5", "clef.shape": "perc"})
+    staffDef = ET.SubElement(staffGrp, "{%s}staffDef" % mei_ns, {"n": "1", "lines": "5", "clef.shape": "perc"})
+    
+    import random
+    import string
+    def generate_id():
+        return "m" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=7))
+    
+    ET.SubElement(staffDef, "{%s}meterSig" % mei_ns, {"xml:id": generate_id(), "count": meter_count, "unit": meter_unit})
     
     section = ET.SubElement(score, "{%s}section" % mei_ns)
-    measure = ET.SubElement(section, "{%s}measure" % mei_ns, {"n": "1"})
-    staff = ET.SubElement(measure, "{%s}staff" % mei_ns, {"n": "1"})
+    
+    # Always add an empty zero measure at the beginning
+    measure0 = ET.SubElement(section, "{%s}measure" % mei_ns, {"n": "0"})
+    staff0 = ET.SubElement(measure0, "{%s}staff" % mei_ns, {"n": "1"})
+    layer0_staff0 = ET.SubElement(staff0, "{%s}layer" % mei_ns)
+    ET.SubElement(layer0_staff0, "{%s}rest" % mei_ns, {"dur": "4"})
     
     # We will compute the steps for Layer 1 and Layer 2
     # Layer 1 = highest pitch. We do a rough ranking based on oct and pname.
@@ -73,92 +84,79 @@ def generate_mei(pattern):
         p_val = pnames.get(props['pname'], 0)
         return octave * 10 + p_val
 
-    # Assuming each step is a 16th note, dur="16"
-    step_duration = "16" 
-
-    layer1_elements = []
-    layer2_elements = []
-
-    for step_idx in range(length):
-        active_instruments = []
-        for track_name, steps in tracks.items():
-            if step_idx < len(steps):
-                step_val = steps[step_idx]
-                if step_val in ['Note', 'Accent', 'Flam']:
-                    active_instruments.append((track_name, step_val))
+    is_triplet_4_4 = (length == 12 and signature != "12/8")
+    is_12_8 = (signature == "12/8")
+    
+    # If the length of the pattern is 32, it should be split into 2 measures
+    steps_per_measure = 16 if length == 32 else length
+    if steps_per_measure == 0:
+        steps_per_measure = 16
         
-        global_accent = False
-        if step_idx < len(accent_track):
-            if accent_track[step_idx] == 'Accent':
-                global_accent = True
-
-        if not active_instruments:
-            layer1_elements.append(("rest", None, None))
-            layer2_elements.append(("rest", None, None))
-        else:
-            # Sort instruments by pitch height descending
-            active_instruments.sort(key=lambda x: pitch_rank(x[0]), reverse=True)
-            
-            # Layer 1 gets the highest note
-            layer1_elements.append(("note", active_instruments[0], global_accent))
-            
-            # Layer 2 gets the rest (if any)
-            if len(active_instruments) > 1:
-                layer2_elements.append(("chord", active_instruments[1:], global_accent))
-            else:
-                layer2_elements.append(("rest", None, None))
-
     # Function to create layer and apply beams
-    def build_layer(layer_n, elements):
-        layer = ET.SubElement(staff, "{%s}layer" % mei_ns, {"n": str(layer_n)})
+    def build_layer(layer_n, elements, current_staff):
+        layer = ET.SubElement(current_staff, "{%s}layer" % mei_ns, {"n": str(layer_n)})
         
         # Stem direction based on layer: Layer 1 is up, Layer 2 is down
         stem_dir = "up" if layer_n == 1 else "down"
         
-        # Group elements into beams of 4 steps (quarter note in 4/4)
-        BEAM_SIZE = 4
+        is_group_of_3 = is_triplet_4_4 or is_12_8
+        BEAM_SIZE = 3 if is_group_of_3 else 4
+        default_dur = "8" if is_group_of_3 else "16"
         
         for i in range(0, len(elements), BEAM_SIZE):
             chunk = elements[i:i + BEAM_SIZE]
             
-            # Enhance chunk elements with a "dur" property defaulting to "16"
-            chunk_with_dur = [{"type": e[0], "data": e[1], "accent": e[2], "dur": "16"} for e in chunk]
+            # Enhance chunk elements with a "dur" property
+            chunk_with_dur = [{"type": e[0], "data": e[1], "accent": e[2], "dur": default_dur} for e in chunk]
             
-            # Simplify rhythms: 
-            # 1) 16th note/chord + 16th space right after -> 8th note
-            # 2) If the whole quarter-note beat (all 4 steps) is just [note(8), space(8)] or [note(4)], turn to 4th note.
             simplified_chunk = []
-            skip_next = False
-            for j in range(len(chunk_with_dur)):
-                if skip_next:
-                    skip_next = False
-                    continue
-                    
-                curr = chunk_with_dur[j]
-                if curr["type"] in ["note", "chord"] and j + 1 < len(chunk_with_dur):
-                    nxt = chunk_with_dur[j+1]
-                    if nxt["type"] == "rest":
-                        curr["dur"] = "8"
-                        simplified_chunk.append(curr)
-                        skip_next = True
+            if is_group_of_3:
+                # Simple triplet or 12/8 rhythm simplification: note(8) + space(8) -> note(4)
+                skip_next = False
+                for j in range(len(chunk_with_dur)):
+                    if skip_next:
+                        skip_next = False
                         continue
                         
-                simplified_chunk.append(curr)
-                
-            # Further simplify: if the first element is now an 8th note, and the ONLY other element is an 8th space (meaning len=2 and [1] is rest)
-            # Or if it was 16th note + 3 16th spaces -> simplified_chunk is [8th note, 16th space, 16th space].
-            # Basically, if the chunk starts with a note, and EVERYTHING else is a rest, it becomes a quarter note.
-            if len(simplified_chunk) > 0 and simplified_chunk[0]["type"] in ["note", "chord"]:
-                all_others_are_rest = True
-                for j in range(1, len(simplified_chunk)):
-                    if simplified_chunk[j]["type"] != "rest":
-                        all_others_are_rest = False
-                        break
-                
-                # If there are trailing spaces to merge
-                if all_others_are_rest and len(simplified_chunk) > 1:
-                    simplified_chunk[0]["dur"] = "4"
-                    simplified_chunk = [simplified_chunk[0]]
+                    curr = chunk_with_dur[j]
+                    if curr["type"] in ["note", "chord"] and j + 1 < len(chunk_with_dur):
+                        nxt = chunk_with_dur[j+1]
+                        if nxt["type"] == "rest":
+                            curr["dur"] = "4"
+                            simplified_chunk.append(curr)
+                            skip_next = True
+                            continue
+                            
+                    simplified_chunk.append(curr)
+            else:
+                # normal simplification logic
+                skip_next = False
+                for j in range(len(chunk_with_dur)):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                        
+                    curr = chunk_with_dur[j]
+                    if curr["type"] in ["note", "chord"] and j + 1 < len(chunk_with_dur):
+                        nxt = chunk_with_dur[j+1]
+                        if nxt["type"] == "rest":
+                            curr["dur"] = "8"
+                            simplified_chunk.append(curr)
+                            skip_next = True
+                            continue
+                            
+                    simplified_chunk.append(curr)
+                    
+                if len(simplified_chunk) > 0 and simplified_chunk[0]["type"] in ["note", "chord"]:
+                    all_others_are_rest = True
+                    for j in range(1, len(simplified_chunk)):
+                        if simplified_chunk[j]["type"] != "rest":
+                            all_others_are_rest = False
+                            break
+                    
+                    if all_others_are_rest and len(simplified_chunk) > 1:
+                        simplified_chunk[0]["dur"] = "4"
+                        simplified_chunk = [simplified_chunk[0]]
             
             # Create full chunk nodes 
             chunk_nodes = []
@@ -196,15 +194,17 @@ def generate_mei(pattern):
                         ET.SubElement(node, "{%s}artic" % mei_ns, {"artic": "acc"})
                     chunk_nodes.append((e_type, node))
             
+            container = layer
+            if is_triplet_4_4:
+                container = ET.SubElement(layer, "{%s}tuplet" % mei_ns, {"num": "3", "numbase": "2"})
+            
             # Logic for omitting spaces outside the beam
-            # If the entire chunk is spaces, just append spaces directly to the layer (no beam at all)
             if not has_note:
                 for _, node in chunk_nodes:
-                    layer.append(node)
+                    container.append(node)
                 continue
                 
             # If we DO have a note, we need a beam. We should also not beam the outer spaces.
-            # Find first and last note indices
             first_note_idx = 0
             last_note_idx = len(chunk_nodes) - 1
             
@@ -217,25 +217,66 @@ def generate_mei(pattern):
                     last_note_idx = idx
                     break
                     
-            # Add early spaces directly to layer
+            # Add early spaces directly to container
             for idx in range(0, first_note_idx):
-                layer.append(chunk_nodes[idx][1])
+                container.append(chunk_nodes[idx][1])
                 
-            # If there's only one note in this 4-step chunk, don't use a beam!
+            # If there's only one note in this chunk, don't use a beam!
             if first_note_idx == last_note_idx:
-                layer.append(chunk_nodes[first_note_idx][1])
+                container.append(chunk_nodes[first_note_idx][1])
             else:
                 # Beam the intermediate elements
-                current_beam = ET.SubElement(layer, "{%s}beam" % mei_ns)
+                current_beam = ET.SubElement(container, "{%s}beam" % mei_ns)
                 for idx in range(first_note_idx, last_note_idx + 1):
                     current_beam.append(chunk_nodes[idx][1])
                 
-            # Add late spaces directly to layer
+            # Add late spaces directly to container
             for idx in range(last_note_idx + 1, len(chunk_nodes)):
-                layer.append(chunk_nodes[idx][1])
+                container.append(chunk_nodes[idx][1])
 
-    build_layer(1, layer1_elements)
-    build_layer(2, layer2_elements)
+    for m_idx in range(0, length, steps_per_measure):
+        measure_n = (m_idx // steps_per_measure) + 1
+        measure = ET.SubElement(section, "{%s}measure" % mei_ns, {"n": str(measure_n)})
+        staff = ET.SubElement(measure, "{%s}staff" % mei_ns, {"n": "1"})
+        
+        layer1_elements = []
+        layer2_elements = []
+
+        m_len = min(steps_per_measure, length - m_idx)
+
+        for rel_idx in range(m_len):
+            step_idx = m_idx + rel_idx
+            
+            active_instruments = []
+            for track_name, steps in tracks.items():
+                if step_idx < len(steps):
+                    step_val = steps[step_idx]
+                    if step_val in ['Note', 'Accent', 'Flam']:
+                        active_instruments.append((track_name, step_val))
+            
+            global_accent = False
+            if step_idx < len(accent_track):
+                if accent_track[step_idx] == 'Accent':
+                    global_accent = True
+
+            if not active_instruments:
+                layer1_elements.append(("rest", None, None))
+                layer2_elements.append(("rest", None, None))
+            else:
+                # Sort instruments by pitch height descending
+                active_instruments.sort(key=lambda x: pitch_rank(x[0]), reverse=True)
+                
+                # Layer 1 gets the highest note
+                layer1_elements.append(("note", active_instruments[0], global_accent))
+                
+                # Layer 2 gets the rest (if any)
+                if len(active_instruments) > 1:
+                    layer2_elements.append(("chord", active_instruments[1:], global_accent))
+                else:
+                    layer2_elements.append(("rest", None, None))
+
+        build_layer(1, layer1_elements, staff)
+        build_layer(2, layer2_elements, staff)
                 
     # Formatting the XML tree into string using minidom for pretty printing
     rough_string = ET.tostring(mei, 'utf-8')
